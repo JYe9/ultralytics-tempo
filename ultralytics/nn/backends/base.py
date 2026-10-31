@@ -211,8 +211,8 @@ class BaseBackend(ABC):
         for k, v in metadata.items():
             if k in {"stride", "batch", "channels"}:
                 metadata[k] = int(v)
-            elif k in {"imgsz", "names", "kpt_shape", "kpt_names", "args", "end2end"} and isinstance(v, str):
-                metadata[k] = ast.literal_eval(v)
+            elif k in {"imgsz", "names", "kpt_shape", "kpt_names", "args", "end2end", "temporal"}:
+                metadata[k] = ast.literal_eval(v) if isinstance(v, str) else v
 
         # Handle models exported with end-to-end NMS
         metadata["end2end"] = bool(metadata.get("end2end", False) or metadata.get("args", {}).get("nms", False))

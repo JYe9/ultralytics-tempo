@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import random
 import re
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +15,19 @@ import torch
 
 from ultralytics.utils import LOGGER
 
-from .augment import Format, RandomHSV
+from .augment import Albumentations, Format, RandomHSV
 from .dataset import YOLODataset
 
-TEMPORAL_DEFAULTS = {"num_frames": 1, "stride": 1, "seq_pattern": None, "diff_channel": False, "random_frames": False}
+# Channel layout of the fused input, stored with the config in checkpoints and export metadata
+FRAME_ORDER = "rgb_frames_earliest_first_target_last_then_diff"
+TEMPORAL_DEFAULTS = {
+    "num_frames": 1,
+    "stride": 1,
+    "seq_pattern": None,
+    "diff_channel": False,
+    "random_frames": False,
+    "frame_order": FRAME_ORDER,
+}
 MIXING_AUGMENTATIONS = ("mosaic", "mixup", "cutmix", "copy_paste")  # combine different images, i.e. times/sequences
 
 
@@ -43,6 +52,8 @@ def check_temporal_cfg(data: dict) -> dict:
         raise ValueError(f"'temporal' num_frames and stride must be >= 1, got {cfg['num_frames']}, {cfg['stride']}")
     if cfg["diff_channel"] and cfg["num_frames"] < 2:
         raise ValueError("'temporal' diff_channel=True needs num_frames >= 2 (difference between t and t-stride)")
+    if cfg["frame_order"] != FRAME_ORDER:
+        raise ValueError(f"'temporal' frame_order {cfg['frame_order']!r} is not supported, expected {FRAME_ORDER!r}")
     if cfg["seq_pattern"] is not None and "idx" not in re.compile(cfg["seq_pattern"]).groupindex:
         raise ValueError(f"'temporal' seq_pattern must define a named group (?P<idx>...), got {cfg['seq_pattern']}")
     channels = 3 * cfg["num_frames"] + cfg["diff_channel"]
@@ -50,6 +61,12 @@ def check_temporal_cfg(data: dict) -> dict:
         raise ValueError(f"data 'channels: {data['channels']}' contradicts 'temporal' config requiring {channels}")
     data["temporal"], data["channels"] = cfg, channels
     return cfg
+
+
+@lru_cache(maxsize=None)
+def _log_albumentations_disabled() -> None:
+    """Log once per process that temporal training does not use Albumentations."""
+    LOGGER.info("Temporal dataset: Albumentations augmentations are disabled for all num_frames, including 1")
 
 
 def sequence_key(path: str, seq_pattern: str | None = None) -> tuple[tuple[str, str], int] | None:
@@ -148,7 +165,11 @@ class TemporalHSV(RandomHSV):
 
 
 class TemporalFormat(Format):
-    """Format that converts stacked BGR frames with `compose_temporal_input` instead of a single BGR-to-RGB flip."""
+    """Format that converts stacked BGR frames with `compose_temporal_input` instead of a single BGR-to-RGB flip.
+
+    As the last transform it runs after every geometric and photometric augmentation (including HSV), so the difference
+    channel is recomputed from the augmented frames t and t-s and is itself never augmented.
+    """
 
     def __init__(self, num_frames: int = 1, diff_channel: bool = False, **kwargs):
         """Initialize TemporalFormat with the frame layout and the standard Format arguments."""
@@ -171,7 +192,7 @@ class TemporalYOLODataset(YOLODataset):
     by frame index. Sample i stacks frames [t-(n-1)s, ..., t] of its own sequence, repeating the first frame where the
     window starts before the sequence. Frames are read one by one with `load_image`, so the regular RAM/disk image cache
     and the augmentation buffer apply per frame. Every spatial and color augmentation runs once on the stacked image, so
-    all frames share identical random parameters; mosaic, mixup, cutmix and copy_paste are disabled.
+    all frames share identical random parameters; mosaic, mixup, cutmix, copy_paste and Albumentations are disabled.
 
     Attributes:
         temporal (dict): Normalized temporal configuration, see `check_temporal_cfg`.
@@ -218,7 +239,7 @@ class TemporalYOLODataset(YOLODataset):
         return label
 
     def build_transforms(self, hyp):
-        """Build YOLODataset transforms without cross-image mixing and with frame-synchronized HSV jitter."""
+        """Build YOLODataset transforms without cross-image mixing or Albumentations, with frame-synchronized HSV."""
         if self.augment:
             if enabled := [k for k in MIXING_AUGMENTATIONS if getattr(hyp, k, 0.0)]:
                 changes = ", ".join(f"{k}={getattr(hyp, k)}->0.0" for k in enabled)
@@ -226,6 +247,9 @@ class TemporalYOLODataset(YOLODataset):
             for k in MIXING_AUGMENTATIONS:
                 setattr(hyp, k, 0.0)
         transforms = super().build_transforms(hyp)
+        if self.augment:  # Albumentations handles 1/3-channel images only, so drop it for every n (n=1 included)
+            transforms.transforms = [t for t in transforms.transforms if not isinstance(t, Albumentations)]
+            _log_albumentations_disabled()
         for i, t in enumerate(transforms.transforms):
             if type(t) is RandomHSV:
                 transforms.transforms[i] = TemporalHSV(t.hgain, t.sgain, t.vgain)

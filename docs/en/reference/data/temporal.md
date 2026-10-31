@@ -28,6 +28,10 @@ keywords: Ultralytics, ultralytics.data.temporal, API reference, YOLO, Python
 
 <br><br><hr><br>
 
+## ::: ultralytics.data.temporal._log_albumentations_disabled
+
+<br><br><hr><br>
+
 ## ::: ultralytics.data.temporal.sequence_key
 
 <br><br><hr><br>

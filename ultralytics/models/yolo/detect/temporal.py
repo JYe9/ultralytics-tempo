@@ -73,8 +73,10 @@ class TemporalPredictor(DetectionPredictor):
     `TemporalYOLODataset`, repeating the first frame until the buffer is full; results belong to the newest frame t.
     The buffer restarts when the source path changes for videos and streams, or when the sequence id changes for image
     files (using `seq_pattern`, or one sequence per directory). Image names without a sequence id, such as in-memory
-    numpy frames, continue the current stream, so calling predict() once per frame keeps the buffer. The temporal config is read from the trained model's
-    `yaml['temporal']`, or from the `data` YAML for exported models.
+    numpy frames, continue the current stream, so calling predict() once per frame keeps the buffer.
+
+    The temporal config comes from the model metadata first (`yaml['temporal']` of a checkpoint, or the `temporal` entry
+    of exported-model metadata) and from the `data` YAML only when the model carries none.
 
     Examples:
         >>> from ultralytics import YOLO
@@ -85,9 +87,16 @@ class TemporalPredictor(DetectionPredictor):
     def setup_model(self, model, verbose: bool = True):
         """Set up the model and resolve the temporal frame layout it expects."""
         super().setup_model(model, verbose)
-        cfg = getattr(getattr(self.model, "model", None), "yaml", {}).get("temporal")
-        if cfg is None and self.args.data and Path(self.args.data).suffix in {".yaml", ".yml"}:
-            cfg = YAML.load(self.args.data).get("temporal")  # exported models carry no temporal config
+        cfg = getattr(self.model, "temporal", None)  # export metadata
+        cfg = cfg or (getattr(getattr(self.model, "model", None), "yaml", None) or {}).get("temporal")  # checkpoint
+        data_yaml = self.args.data if self.args.data and Path(self.args.data).suffix in {".yaml", ".yml"} else None
+        data_cfg = YAML.load(data_yaml).get("temporal") if data_yaml and Path(data_yaml).is_file() else None
+        if cfg is None:
+            cfg = data_cfg
+        elif data_cfg:
+            a, b = check_temporal_cfg({"temporal": dict(cfg)}), check_temporal_cfg({"temporal": data_cfg})
+            if any(a[k] != b[k] for k in ("num_frames", "stride", "diff_channel", "frame_order")):
+                LOGGER.warning(f"TemporalPredictor: data={data_yaml} temporal config differs, using model metadata {a}")
         data = {"temporal": cfg or {}, "channels": self.model.channels}
         self.temporal = check_temporal_cfg(data)
         self.buffer = deque(maxlen=(self.temporal["num_frames"] - 1) * self.temporal["stride"] + 1)
