@@ -663,6 +663,7 @@ nav:
           - loaders: reference/data/loaders.md
           - split: reference/data/split.md
           - split_dota: reference/data/split_dota.md
+          - temporal: reference/data/temporal.md
           - utils: reference/data/utils.md
       - engine:
           - exporter: reference/engine/exporter.md
@@ -730,6 +731,7 @@ nav:
                   - val: reference/models/yolo/depth/val.md
               - detect:
                   - predict: reference/models/yolo/detect/predict.md
+                  - temporal: reference/models/yolo/detect/temporal.md
                   - train: reference/models/yolo/detect/train.md
                   - val: reference/models/yolo/detect/val.md
               - model: reference/models/yolo/model.md
