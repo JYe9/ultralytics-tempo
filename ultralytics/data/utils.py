@@ -776,6 +776,10 @@ def check_det_dataset(dataset: str | Path, autodownload: bool = True, split: str
         data["nc"] = len(data["names"])
 
     data["names"] = check_class_names(data["names"])
+    if data.get("temporal"):  # multi-frame early fusion sets channels = 3 * num_frames (+1 difference channel)
+        from ultralytics.data.temporal import check_temporal_cfg
+
+        check_temporal_cfg(data)
     data["channels"] = data.get("channels", 3)  # get image channels, default to 3
 
     # Resolve paths

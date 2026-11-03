@@ -36,6 +36,7 @@ from ultralytics.data.loaders import (
     SourceTypes,
     autocast_list,
 )
+from ultralytics.data.temporal import TemporalYOLODataset
 from ultralytics.data.utils import IMG_FORMATS, VID_FORMATS, add_polygon_background, get_split_fraction
 from ultralytics.utils import RANK, colorstr
 from ultralytics.utils.checks import check_file
@@ -261,8 +262,8 @@ def build_yolo_dataset(
         fraction (float | None, optional): Fraction of the dataset to use. If None, it is derived from cfg.fraction.
 
     Returns:
-        (Dataset): A DepthDataset, SemanticDataset, PolygonSemanticDataset, YOLOMultiModalDataset, or YOLODataset
-            depending on cfg.task, the dataset configuration, and multi_modal.
+        (Dataset): A DepthDataset, SemanticDataset, PolygonSemanticDataset, YOLOMultiModalDataset,
+            TemporalYOLODataset, or YOLODataset depending on cfg.task, the dataset configuration, and multi_modal.
     """
     pad = 0.0 if mode == "train" else 0.5
     rect = cfg.rect or rect
@@ -276,6 +277,8 @@ def build_yolo_dataset(
         pad = 0.0  # no pad for semantic
     elif multi_modal:
         dataset = YOLOMultiModalDataset
+    elif data.get("temporal"):
+        dataset = TemporalYOLODataset
     else:
         dataset = YOLODataset
 

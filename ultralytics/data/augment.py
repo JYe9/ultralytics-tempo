@@ -1205,11 +1205,18 @@ class RandomPerspective(BaseTransform):
         img = labels["img"]
         M = params["M"]
         size = params["size"]
-        # 4 values: cv2 tiles borderValue in blocks of 4, so a 3-tuple zeroes every 4th multispectral channel
-        if self.perspective:
-            img = cv2.warpPerspective(img, M, dsize=size, borderValue=(114, 114, 114, 114))
-        else:  # affine
-            img = cv2.warpAffine(img, M[:2], dsize=size, borderValue=(114, 114, 114, 114))
+
+        def warp(x):
+            """Warp an image of at most 4 channels; 4 border values because cv2 tiles them in blocks of 4."""
+            if self.perspective:
+                return cv2.warpPerspective(x, M, dsize=size, borderValue=(114, 114, 114, 114))
+            return cv2.warpAffine(x, M[:2], dsize=size, borderValue=(114, 114, 114, 114))
+
+        if img.ndim == 3 and img.shape[2] > 4:  # cv2 interpolates >4 channels coarsely (~5 levels), warp 3 at a time
+            chunks = np.split(img, range(3, img.shape[2], 3), axis=2)
+            img = np.concatenate([np.atleast_3d(warp(np.ascontiguousarray(x))) for x in chunks], axis=2)
+        else:
+            img = warp(img)
         if img.ndim == 2:
             img = img[..., None]
         labels["img"] = img

@@ -1008,6 +1008,8 @@ class Exporter:
         }  # model metadata
         if self.dla is not None:
             self.metadata["dla"] = self.dla  # make sure `AutoBackend` uses correct dla device if it has one
+        if model.yaml.get("temporal"):  # multi-frame early fusion: frame count, stride, diff channel, frame order
+            self.metadata["temporal"] = model.yaml["temporal"]
         if model.task == "pose":
             self.metadata["kpt_shape"] = model.model[-1].kpt_shape
             if hasattr(model, "kpt_names"):
