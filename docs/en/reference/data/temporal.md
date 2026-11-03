@@ -28,6 +28,10 @@ keywords: Ultralytics, ultralytics.data.temporal, API reference, YOLO, Python
 
 <br><br><hr><br>
 
+## ::: ultralytics.data.temporal.runtime_temporal_cfg
+
+<br><br><hr><br>
+
 ## ::: ultralytics.data.temporal._log_albumentations_disabled
 
 <br><br><hr><br>
@@ -41,6 +45,10 @@ keywords: Ultralytics, ultralytics.data.temporal, API reference, YOLO, Python
 <br><br><hr><br>
 
 ## ::: ultralytics.data.temporal.window_positions
+
+<br><br><hr><br>
+
+## ::: ultralytics.data.temporal.slot_positions
 
 <br><br><hr><br>
 

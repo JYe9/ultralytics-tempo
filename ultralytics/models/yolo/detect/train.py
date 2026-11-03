@@ -14,7 +14,7 @@ from torch import nn
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
-from ultralytics.models.yolo.detect.temporal import inflate_first_conv
+from ultralytics.models.yolo.detect.temporal import attach_film, inflate_first_conv
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 from ultralytics.utils.plotting import plot_images, plot_labels
@@ -194,9 +194,11 @@ class DetectionTrainer(BaseTrainer):
             DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
         )
         temporal = self.data.get("temporal")
+        if temporal and temporal["cond"] == "film":  # identity (n, stride) FiLM on the stem, before loading weights
+            attach_film(model, temporal)
         if weights:
-            if temporal:  # multi-frame early fusion: inflate the 3-channel pretrained first conv to 3n(+1) channels
-                weights = inflate_first_conv(deepcopy(weights), temporal["num_frames"], temporal["diff_channel"])
+            if temporal:  # multi-frame early fusion: inflate the 3-channel pretrained first conv to 3K(+1) channels
+                weights = inflate_first_conv(deepcopy(weights), temporal["max_frames"], temporal["diff_channel"])
             model.load(weights)
         if temporal:
             model.yaml["temporal"] = temporal  # saved with the checkpoint for TemporalPredictor

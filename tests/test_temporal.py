@@ -23,10 +23,19 @@ from ultralytics.data.temporal import (
     check_temporal_cfg,
     group_sequences,
     sequence_key,
+    slot_positions,
 )
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.detect import DetectionTrainer
-from ultralytics.models.yolo.detect.temporal import TemporalPredictor, inflate_first_conv
+from ultralytics.models.yolo.detect.temporal import (
+    FrameFiLM,
+    TemporalPredictor,
+    TemporalValidator,
+    attach_film,
+    find_film,
+    inflate_first_conv,
+    set_frame_cond,
+)
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import YAML
 from ultralytics.utils.checks import check_requirements
@@ -45,6 +54,7 @@ def load_script(name):
 make_synthetic_seq = load_script("make_synthetic_seq")
 prepare = load_script("prepare_seq_dataset")
 run_matrix = load_script("run_matrix")
+eval_anyframe = load_script("eval_anyframe")
 
 IMGSZ = 128
 AUG = {
@@ -90,7 +100,7 @@ def test_check_temporal_cfg():
     data = {"temporal": {"num_frames": 3, "diff_channel": True}}
     assert check_temporal_cfg(data)["stride"] == 1 and data["channels"] == 10
     assert check_temporal_cfg(data) == data["temporal"]  # idempotent
-    for bad in ({"num_frames": 0}, {"num_frames": 1, "diff_channel": True}, {"seq_pattern": r"(\d+)"}, {"nframes": 2}):
+    for bad in ({"num_frames": 0}, {"num_frames": 4, "max_frames": 3}, {"seq_pattern": r"(\d+)"}, {"nframes": 2}):
         with pytest.raises(ValueError):
             check_temporal_cfg({"temporal": bad})
     with pytest.raises(ValueError):
@@ -182,7 +192,7 @@ def test_mixing_augmentations_disabled(tmp_path):
 
 
 def test_random_frames_zero_slots(tmp_path):
-    """Reserved random_frames mode samples n in [1, K] and zeroes the earliest unused slots."""
+    """Stage-1 random_frames=True maps to train_frames 1..K: n is sampled and the earliest unused slots are zero."""
     data = make_data(tmp_path, num_frames=3, random_frames=True)
     dataset = build(data, "train", **{k: 0.0 for k in AUG})
     zero_slots = set()
@@ -205,7 +215,7 @@ def test_n1_matches_yolodataset(tmp_path):
         b.transforms.transforms = [t for t in b.transforms.transforms if not isinstance(t, Albumentations)]
         for i in (0, 11, 30):
             x, y = seeded(a, i, i), seeded(b, i, i)
-            assert x.keys() == y.keys()
+            assert x.pop("frame_cond").tolist() == [1, 1] and x.keys() == y.keys()
             for k in ("img", "cls", "bboxes", "batch_idx"):
                 assert torch.equal(x[k], y[k]), k
 
@@ -292,13 +302,30 @@ def test_albumentations_disabled(tmp_path):
         assert not any(isinstance(t, Albumentations) for t in dataset.transforms.transforms)
 
 
-def test_predictor_matches_dataset(tmp_path):
-    """TemporalPredictor ring buffer builds exactly the val dataset inputs, restarting per sequence."""
-    data = make_data(tmp_path, num_frames=3, stride=2, diff_channel=True)
-    dataset = build(data, "val")
+ANYFRAME = {"max_frames": 5, "train_frames": [1, 2, 3, 5], "train_strides": [1, 2, 3]}
+
+
+@pytest.mark.parametrize(
+    "temporal,runtime",
+    [
+        ({"num_frames": 3, "stride": 2, "diff_channel": True}, None),  # stage 1, fixed n
+        ({**ANYFRAME, "diff_channel": True, "slot_fill": "zero"}, (2, 3)),  # runtime n < K
+        ({**ANYFRAME, "slot_fill": "repeat"}, (1, 2)),
+        ({**ANYFRAME, "diff_channel": True, "slot_fill": "repeat", "cond": "film"}, (5, 1)),
+    ],
+)
+def test_predictor_matches_dataset(tmp_path, temporal, runtime):
+    """TemporalPredictor at a runtime (n, stride) builds exactly the val dataset inputs, restarting per sequence."""
+    data = make_data(tmp_path, **temporal)
     model = DetectionModel("yolo26n.yaml", nc=3, ch=data["channels"], verbose=False)
     model.yaml["temporal"] = data["temporal"]
-    predictor = TemporalPredictor(overrides={"imgsz": IMGSZ, "device": "cpu", "save": False, "verbose": False})
+    if data["temporal"]["cond"] == "film":
+        attach_film(model, data["temporal"])
+    if runtime:  # validation dataset at the same runtime pair
+        data = {**data, "temporal": {**data["temporal"], "num_frames": runtime[0], "stride": runtime[1]}}
+    dataset = build(data, "val")
+    predictor_cls = TemporalPredictor.at(*runtime) if runtime else TemporalPredictor
+    predictor = predictor_cls(overrides={"imgsz": IMGSZ, "device": "cpu", "save": False, "verbose": False})
     inputs = []
     predictor.preprocess = lambda im, f=predictor.preprocess: inputs.append(f(im)) or inputs[-1]
     files = sorted(dataset.im_files, key=frame_id)  # 3 sequences, frames in temporal order
@@ -308,6 +335,8 @@ def test_predictor_matches_dataset(tmp_path):
     for k, f in enumerate(files):
         expected = dataset[dataset.im_files.index(f)]["img"].float() / 255
         torch.testing.assert_close(x[k], expected, rtol=0, atol=0)
+    if runtime:
+        assert (predictor.temporal["num_frames"], predictor.temporal["stride"]) == runtime
 
 
 def test_train_val_predict_export(tmp_path):
@@ -356,6 +385,9 @@ def test_train_val_predict_export(tmp_path):
         model = YOLO(exported, task="detect")  # no data=: the temporal config comes from the export metadata
         results = model.predict(frames, predictor=TemporalPredictor, imgsz=IMGSZ, device="cpu")
         assert len(results) == len(frames) and model.predictor.temporal == trained.model.yaml["temporal"]
+        model = YOLO(exported, task="detect")  # cond='none': exported models switch (n, stride) at runtime
+        results = model.predict(frames, predictor=TemporalPredictor.at(1, 2), imgsz=IMGSZ, device="cpu")
+        assert len(results) == len(frames) and model.predictor.temporal["num_frames"] == 1
 
 
 # Dataset adapters (scripts/tempo/prepare_seq_dataset.py) on tiny synthetic layouts ------------------------------------
@@ -518,3 +550,232 @@ def test_run_matrix_fair_hyperparameters(tmp_path):
     run_matrix.main(run_matrix.parse_args([*args, "--project", str(tmp_path / "runs"), "--out", str(out)]))
     with open(out) as f:
         assert len(list(csv.DictReader(f))) == 1  # completed experiments are skipped
+
+
+# Stage 2a: any-frame training, FiLM conditioning, runtime (n, stride) -------------------------------------------------
+def test_anyframe_cfg():
+    """max_frames fixes channels at 3K(+1); defaults derive from the training sets; invalid values raise."""
+    data = {"temporal": {**ANYFRAME, "diff_channel": True}}
+    t = check_temporal_cfg(data)
+    assert data["channels"] == 16 and (t["num_frames"], t["stride"], t["slot_fill"], t["cond"]) == (
+        5,
+        1,
+        "zero",
+        "none",
+    )
+    t = check_temporal_cfg({"temporal": {"train_frames": [3, 1, 3]}})
+    assert (t["max_frames"], t["num_frames"], t["train_frames"], t["train_strides"]) == (3, 3, [1, 3], [1])
+    t = check_temporal_cfg({"temporal": {"num_frames": 2}})  # stage-1 config: K = n, one training (n, stride)
+    assert (t["max_frames"], t["train_frames"], t["train_strides"]) == (2, [2], [1])
+    legacy = check_temporal_cfg({"temporal": {"num_frames": 3, "random_frames": False}})  # stage-1 metadata loads
+    assert legacy["train_frames"] == [3] and "random_frames" not in legacy
+    for bad in ({"max_frames": 3, "train_frames": [4]}, {"train_strides": [0]}, {"slot_fill": "x"}, {"cond": "y"}):
+        with pytest.raises(ValueError):
+            check_temporal_cfg({"temporal": bad})
+
+
+def test_slot_positions():
+    """The n frames fill the last slots (target last), earlier slots repeat the earliest one, t-stride follows."""
+    assert slot_positions(7, 2, 3, 5, False) == [4, 4, 4, 4, 7]
+    assert slot_positions(7, 2, 3, 5, True) == [4, 4, 4, 4, 7, 4]
+    assert slot_positions(1, 3, 2, 3, True) == [0, 0, 1, 0]  # clamped at the sequence start
+    assert slot_positions(9, 1, 2, 3, True) == [9, 9, 9, 7]  # n=1 still gets |t - (t-stride)|
+
+
+def test_frame_sampling_distribution(tmp_path):
+    """Training draws n and stride uniformly and independently from their sets; evaluation uses the fixed pair."""
+    data = make_data(tmp_path, **ANYFRAME, num_frames=3, stride=2)
+    train = build(data, "train")
+    random.seed(0)
+    draws = [train.sample_frames() for _ in range(6000)]
+    pairs = {(n, s): draws.count((n, s)) for n in ANYFRAME["train_frames"] for s in ANYFRAME["train_strides"]}
+    assert sum(pairs.values()) == len(draws)  # nothing outside the sets
+    assert all(abs(c - 500) < 100 for c in pairs.values()), pairs  # 12 pairs, 500 expected each
+    assert build(data, "val").sample_frames() == (3, 2)
+
+
+@pytest.mark.parametrize("slot_fill", ["zero", "repeat"])
+def test_target_slot_fixed(tmp_path, slot_fill):
+    """The target frame is always the last slot; earlier unused slots follow slot_fill; diff is |t - (t-stride)|."""
+    import cv2
+
+    data = make_data(tmp_path, **ANYFRAME, slot_fill=slot_fill, diff_channel=True)
+    dataset = build(data, "train", **{k: 0.0 for k in AUG})  # no augmentation, frames stay raw
+    i = 9  # seq0 frame 9
+    target = cv2.imread(dataset.im_files[i])[..., ::-1].transpose(2, 0, 1)
+    seen = set()
+    for seed in range(40):
+        x = seeded(dataset, i, seed)
+        img, (n, s) = x["img"].numpy(), x["frame_cond"].tolist()
+        seen.add((n, s))
+        np.testing.assert_array_equal(img[12:15], target)  # last of K=5 slots
+        first = 3 * (5 - n)
+        for k in range(0, first, 3):
+            expected = np.zeros_like(target) if slot_fill == "zero" else img[first : first + 3]
+            np.testing.assert_array_equal(img[k : k + 3], expected)
+        ref = cv2.imread(dataset.im_files[dataset.sequences[0][max(9 - s, 0)]])
+        gray = [
+            cv2.cvtColor(np.ascontiguousarray(im), cv2.COLOR_BGR2GRAY)
+            for im in (target.transpose(1, 2, 0)[..., ::-1], ref)
+        ]
+        np.testing.assert_array_equal(img[15], cv2.absdiff(*gray))
+    assert len({n for n, _ in seen}) > 2 and len({s for _, s in seen}) > 1
+
+
+def test_mixed_frames_batch(tmp_path):
+    """A training batch mixes different (n, stride) and carries them as a (B, 2) frame_cond tensor."""
+    from ultralytics.data import build_dataloader
+
+    data = make_data(tmp_path, **ANYFRAME)
+    loader = build_dataloader(build(data, "train"), batch=16, workers=0, shuffle=False)
+    batch = next(iter(loader))
+    assert batch["img"].shape[1] == 15 and batch["frame_cond"].shape == (16, 2)
+    assert len({tuple(c) for c in batch["frame_cond"].tolist()}) > 1
+
+
+def film_model(cond="film", ch=15):
+    """Return a seeded eval-mode K=5 model, optionally with an identity FiLM."""
+    torch.manual_seed(0)
+    model = DetectionModel("yolo26n.yaml", nc=3, ch=ch, verbose=False).eval()
+    t = check_temporal_cfg({"temporal": dict(ANYFRAME)})
+    return attach_film(model, t) if cond == "film" else model
+
+
+def test_film_identity_and_per_sample_cond():
+    """Identity-initialized FiLM leaves outputs bit-identical for any (n, s); once trained it conditions per sample."""
+    plain, film = film_model("none"), film_model("film")
+    x = torch.rand(2, 15, 64, 64)
+    with torch.no_grad():
+        ref = plain(x)[0]
+        assert torch.equal(film(x)[0], ref)
+        film.film.cond = torch.tensor([[1, 1], [5, 3]])
+        assert torch.equal(film(x)[0], ref)
+    f = film.film
+    torch.nn.init.normal_(f.mlp[-1].weight, std=0.5)
+    feats = torch.rand(3, 32, 8, 8).repeat(2, 1, 1, 1)[:2]  # two identical samples
+    cond = torch.tensor([[1, 1], [5, 3]])
+    out = f(feats, cond)
+    assert not torch.allclose(out[0], out[1])  # different (n, s) per sample in one batch
+    torch.testing.assert_close(out[1:], f(feats[1:], cond[1:]))
+
+
+def test_film_loads_stage1_weights(tmp_path):
+    """A FiLM model built by the trainer from stage-1 weights (same K) gives the stage-1 outputs exactly."""
+    yaml = make_synthetic_seq.make_dataset(tmp_path / "s", temporal={**ANYFRAME, "cond": "film"})
+    stage1 = film_model("none")
+    trainer = DetectionTrainer(overrides={"model": "yolo26n.yaml", "data": str(yaml), "project": str(tmp_path)})
+    model = trainer.get_model(cfg="yolo26n.yaml", weights=stage1, verbose=False).eval()
+    assert isinstance(model.film, FrameFiLM) and model.yaml["temporal"]["cond"] == "film"
+    x = torch.rand(2, 15, 64, 64)
+    with torch.no_grad():
+        assert torch.equal(model(x)[0], stage1(x)[0])
+    assert "film.mlp.2.weight" in model.state_dict()
+    assert all(k in model.state_dict() for k in stage1.state_dict())  # existing keys unchanged
+
+
+def test_film_captures_batch_cond():
+    """In a training forward the model reads frame_cond from the batch and releases it afterwards."""
+    model = film_model("film").train()
+    model.args = get_cfg()  # loss hyperparameters
+    seen = []
+    model.model[1].register_forward_hook(lambda m, a, o: seen.append(model.film.cond))
+    cond = torch.tensor([[1, 1], [3, 2]])
+    batch = {
+        "img": torch.rand(2, 15, 64, 64),
+        "frame_cond": cond,
+        "cls": torch.zeros(0, 1),
+        "bboxes": torch.zeros(0, 4),
+    }
+    batch["batch_idx"] = torch.zeros(0)
+    model(batch)
+    assert seen and seen[0] is cond and model.film.cond is None
+
+
+def test_anyframe_train_val_predict_export(tmp_path):
+    """K=5 any-frame FiLM model: mixed-n training, runtime (n, stride) val/predict, metadata, ONNX, eval script."""
+    temporal = {**ANYFRAME, "num_frames": 3, "diff_channel": True, "cond": "film"}
+    yaml = make_synthetic_seq.make_dataset(tmp_path / "synth", temporal=temporal)
+    model = YOLO("yolo26n.yaml")
+    model.train(data=str(yaml), imgsz=64, epochs=1, batch=8, device="cpu", workers=0, project=str(tmp_path), name="t")
+    best = model.trainer.best
+    trained = YOLO(best)
+    film = find_film(trained.model)
+    assert film is not None and film.mlp[-1].weight.abs().sum() > 0  # FiLM trained, hooks survive the checkpoint
+    assert trained.model.yaml["temporal"]["max_frames"] == 5 and trained.model.yaml["channels"] == 16
+
+    for n, s in ((1, 1), (5, 3)):
+        m = YOLO(best).val(data=str(yaml), imgsz=64, batch=8, device="cpu", validator=TemporalValidator.at(n, s))
+        assert 0.0 <= m.box.map50 <= 1.0
+    with pytest.raises(ValueError):  # n > max_frames
+        YOLO(best).val(data=str(yaml), imgsz=64, device="cpu", validator=TemporalValidator.at(6, 1))
+
+    frames = sorted((tmp_path / "synth" / "images").glob("seq1_*.png"))
+    stream = YOLO(best)
+    for f in frames[:4]:  # cached predictor class: the buffer persists across per-frame calls
+        stream.predict(str(f), predictor=TemporalPredictor.at(2, 2), imgsz=64, device="cpu", verbose=False)
+    assert len(stream.predictor.buffer) == 3 and stream.predictor.film.cond is None
+
+    torch.manual_seed(0)
+    torch.nn.init.normal_(find_film(trained.model).mlp[-1].weight, std=5.0)  # strong FiLM, visible at the output
+    set_frame_cond(trained.model, 2, 1)  # bake (2, 1) into the export
+    exported = trained.export(format="onnx", imgsz=64, device="cpu")
+    import onnxruntime
+
+    x = torch.rand(1, 16, 64, 64)
+    session = onnxruntime.InferenceSession(exported, providers=["CPUExecutionProvider"])
+    ort = torch.from_numpy(session.run(None, {session.get_inputs()[0].name: x.numpy()})[0])
+    net = deepcopy(trained.model).eval()
+    with torch.no_grad():
+        same = (ort - net(x)[0]).abs().max()
+        find_film(net).default = (5, 3)
+        other = (ort - net(x)[0]).abs().max()
+    assert other > 100 * same  # the graph runs FiLM at the baked (2, 1), not at another pair or as identity
+    onnx_model = YOLO(exported, task="detect")
+    results = onnx_model.predict(frames, predictor=TemporalPredictor, imgsz=64, device="cpu")
+    assert len(results) == len(frames) and (
+        onnx_model.predictor.temporal["num_frames"],
+        onnx_model.predictor.temporal["stride"],
+    ) == (2, 1)
+    with pytest.raises(ValueError):  # baked pair only
+        YOLO(exported, task="detect").predict(frames[:1], predictor=TemporalPredictor.at(3, 1), imgsz=64, device="cpu")
+
+    out = tmp_path / "any.csv"
+    args = ["--model", str(best), "--data", str(yaml), "--frames", "1", "5", "--strides", "1", "3", "--imgsz", "64"]
+    eval_anyframe.main(
+        eval_anyframe.parse_args([*args, "--batch", "8", "--device", "cpu", "--iters", "1", "--out", str(out)])
+    )
+    import csv
+
+    with open(out) as f:
+        rows = list(csv.DictReader(f))
+    assert [(r["num_frames"], r["stride"]) for r in rows] == [("1", "1"), ("1", "3"), ("5", "1"), ("5", "3")]
+    assert all(r["error"] == "" and float(r["latency_ms"]) > 0 for r in rows) and rows[0]["trained"] == "True"
+
+
+def test_visdrone_mask_ignored(tmp_path):
+    """Each frame's own ignored regions are filled with the mask value; --no-mask-ignored keeps the frames as is."""
+    import cv2
+
+    seq = tmp_path / "vd" / "VisDrone2019-VID-train" / "sequences" / "uav1"
+    write_frames(seq, [f"{i:07d}.jpg" for i in range(1, 4)])
+    (seq.parent.parent / "annotations").mkdir()
+    (seq.parent.parent / "annotations" / "uav1.txt").write_text(
+        "1,0,10,10,20,10,1,1,0,0\n2,-1,4,6,10,8,0,0,0,0\n3,-1,30,20,40,40,0,0,0,0\n"  # frames 2 and 3 have regions
+    )
+    source = [cv2.imread(str(f)) for f in sorted(seq.glob("*.jpg"))]
+    seqs, _, _ = adapter("visdrone-vid", tmp_path / "vd")
+    assert seqs[0].ignored == [[], [(4, 6, 14, 14)], [(30, 20, 64, 48)]]
+
+    for flags, masked in (([], True), (["--no-mask-ignored"], False), (["--mask-value", "0"], True)):
+        data = convert("visdrone-vid", tmp_path / "vd", tmp_path, *flags)  # frames 1-2 train, frame 3 val
+        out = sorted((Path(data["train"]) / "uav1").glob("*.jpg")) + sorted((Path(data["val"]) / "uav1").glob("*.jpg"))
+        assert len(out) == 3 and out[0].is_symlink() and out[1].is_symlink() != masked
+        value = 0 if "0" in flags else 114
+        im = cv2.imread(str(out[1]))
+
+        def filled(region, value=value):
+            return bool((np.abs(region.astype(int) - value) <= 4).all())  # masked frames are re-encoded as JPEG
+
+        assert filled(im[7:13, 5:13]) == masked and (np.abs(im[20:, :4].astype(int) - 100) <= 4).all()
+        assert filled(cv2.imread(str(out[2]))[21:47, 31:63]) == masked
+    assert all(np.array_equal(cv2.imread(str(f)), s) for f, s in zip(sorted(seq.glob("*.jpg")), source))  # untouched

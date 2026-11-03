@@ -30,32 +30,73 @@ build_yolo_dataset ──> TemporalYOLODataset   DetectionModel(ch=3n(+1))  ← 
 
 ```yaml
 temporal:
-    num_frames: 3 # n，同时也是槽位数上限 K
-    stride: 1 # s，按"序列内可用帧的位置"计数
+    max_frames: 5 # K：槽位数，输入通道固定为 3K(+1)
+    train_frames: [1, 2, 3, 5] # 训练时每个样本随机采样的 n
+    train_strides: [1, 2, 3] # 训练时每个样本随机采样的 stride
+    num_frames: 3 # 验证/推理默认的 n（运行时可改，<= K）
+    stride: 1 # 验证/推理默认的 stride，按"序列内可用帧的位置"计数
+    slot_fill: zero # n < K 时较早槽位的填充：zero（置零）或 repeat（重复最早使用的帧）
+    cond: none # film：用 (n, stride) 对 stem 输出做 FiLM
     seq_pattern: '^(?P<seq>.+)_(?P<idx>\d+)\.(png|jpg)$' # 文件名正则，必须有 idx 组；seq 组可选
-    diff_channel: false # true 时追加 1 个 t 与 t-s 的灰度绝对差通道（需要 n >= 2）
-    random_frames: false # 预留：训练时随机 n∈[1,K]，最早的未用槽位置零（目标帧始终在最后）
+    diff_channel: false # true 时追加 1 个 |gray(t) - gray(t-stride)| 差分通道
     # frame_order: rgb_frames_earliest_first_target_last_then_diff  # 自动写入，标识下方的通道布局
 ```
 
-| 字段            | 默认    | 含义                                                                                                                            |
-| --------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `num_frames`    | `1`     | 输入帧数 n；`n=1` 时与原版 YOLO 行为逐位一致                                                                                    |
-| `stride`        | `1`     | 帧步长 s；窗口为 `[t-(n-1)s, …, t-s, t]`                                                                                        |
-| `seq_pattern`   | `null`  | 文件名正则；`null` 表示"每个子目录是一段视频"，帧号取文件名中最后一个整数。序列 ID 总是包含父目录，因此不同目录永远不会混在一起 |
-| `diff_channel`  | `false` | 追加差分通道，输入通道 `3n+1`，差分在最末                                                                                       |
-| `random_frames` | `false` | 为后续"每个样本帧数可变"预留；只在训练时生效，验证/推理总是用满 K 帧                                                            |
+| 字段            | 默认           | 含义                                                                                                                            |
+| --------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `max_frames`    | 所配置的最大 n | 槽位数 K；输入通道 `3K(+1)`                                                                                                     |
+| `train_frames`  | `[num_frames]` | 训练时每个样本均匀随机采样的 n（同一 batch 内可不同）                                                                           |
+| `train_strides` | `[stride]`     | 训练时每个样本均匀随机采样的 stride，与 n 独立                                                                                  |
+| `num_frames`    | `max_frames`   | 验证/推理默认的 n；只配置 `num_frames` 时即阶段 1 的固定帧模式（K=n），`n=1` 时与原版 YOLO 行为逐位一致                         |
+| `stride`        | `1`            | 验证/推理默认的 stride；窗口为 `[t-(n-1)s, …, t-s, t]`                                                                          |
+| `slot_fill`     | `zero`         | n<K 时前 K-n 个槽位：`zero` 在全部增强之后置零；`repeat` 重复最早使用的帧                                                       |
+| `cond`          | `none`         | `film`：FiLM 条件编码，见下文                                                                                                   |
+| `seq_pattern`   | `null`         | 文件名正则；`null` 表示"每个子目录是一段视频"，帧号取文件名中最后一个整数。序列 ID 总是包含父目录，因此不同目录永远不会混在一起 |
+| `diff_channel`  | `false`        | 追加差分通道，放在最末；任何 n（包括 1）都用 t 与 t-stride 计算                                                                 |
+
+阶段 1 的 `random_frames: true` 仍可读取，等价于 `train_frames: [1..K]`（置零填充）；该字段已被上面的字段取代。
 
 - 不要再手写 `channels:`；若写了且与 `3n(+1)` 不一致会报错。
 - 序列开头不足 `(n-1)s` 帧时，用该序列最早可用帧补齐；不会跨序列取帧。不匹配 `seq_pattern` 的图片当作 1 帧序列并打印警告数量。
 
-**帧顺序约定**：通道 `[0:3]` 是最早帧，`[3(n-1):3n]` 是目标帧 t，开启差分时最后 1 个通道是差分；每帧均为 RGB。该约定以 `frame_order` 字段随配置保存，布局不一致的配置会被拒绝。
+**帧顺序约定**：K 个槽位，通道 `[0:3]` 是最早的槽位，`[3(K-1):3K]` 是目标帧 t（始终在最后一个槽位），n 帧占据最后 n 个槽位，开启差分时最后 1 个通道是差分；每帧均为 RGB。该约定以 `frame_order` 字段随配置保存，布局不一致的配置会被拒绝。
 
 ## 模型
 
 - `inflate_first_conv(model, n, diff_channel)`（`ultralytics/models/yolo/detect/temporal.py`）：RGB 权重沿输入通道复制 n 次再乘 `1/n`，差分通道权重为 0。n 帧完全相同且差分为 0 时，第一层（乃至整个模型）的输出与原 3 通道模型一致（`tests/test_temporal.py::test_inflate_first_conv`）。
 - 训练入口：`DetectionTrainer.get_model` 发现 `data["temporal"]` 时，会先对 3 通道预训练权重（`yolo26n.pt` 等）的深拷贝调用 `inflate_first_conv`，再交给 `BaseModel.load`。此时首层形状已经一致，`BaseModel.load` 自带的"首层通道不匹配"分支（只把 RGB 滤波器原样拷进前 3 个通道、其余保持随机初始化）不会触发，最终生效的是 `inflate_first_conv` 的结果（`test_trainer_inflates_pretrained_pt` 从随机初始化 3 通道模型保存的 .pt 出发，走真实的 `setup_model → get_model` 路径验证）。
-- 元数据：`temporal` 配置（num_frames、stride、diff_channel、random_frames、seq_pattern、frame_order）写进 `model.yaml["temporal"]`，随 checkpoint 保存；导出时写入导出模型 metadata 的 `temporal` 字段（ONNX 等格式均适用）。
+- 元数据：`temporal` 配置（max_frames、num_frames、stride、train_frames、train_strides、slot_fill、cond、diff_channel、seq_pattern、frame_order）写进 `model.yaml["temporal"]`，随 checkpoint 保存；导出时写入导出模型 metadata 的 `temporal` 字段（ONNX 等格式均适用）。
+
+## 阶段 2a：任意帧数（一次训练，运行时切换 n 与 stride）
+
+- **训练**：每个样本独立采样 `n ∈ train_frames`、`stride ∈ train_strides`，batch 中以 `frame_cond`（B×2 张量）携带。为了让 diff 对任何 n 都是 `|t − (t−stride)|`，t−stride 这一帧作为额外 3 通道随其它帧一起做同一次增强，在 `TemporalFormat` 中算出差分后丢弃。`train_frames`/`train_strides` 只有一个取值时不消耗随机数，阶段 1 的训练逐位不变。
+- **FiLM（`cond: film`）**：`FrameFiLM` 把 `(n/K, s/S, (n−1)s/((K−1)S))` 经 MLP 映射为逐通道 `(scale, shift)`，作用在 stem 第二层卷积（`model.model[1]`）的输出上：`x·(1+scale)+shift`。最后一层零初始化，所以初始时严格恒等（逐位相等），从阶段 1 权重（相同 K）加载后行为不变。模块挂在 `model.film`，现有 state-dict 键名不变，通过 forward hook 生效：训练时模型的 pre-hook 从 batch 读取 `frame_cond`，loss 计算后释放；没有 `cond` 时使用 `default`（即 `num_frames, stride`）。
+- **导出：(n, stride) 作为编译期常量**。理由：
+    1. Ultralytics 的 AutoBackend 和 20 多种导出后端都假设单一图像输入，增加第二个输入需要改动每个后端以及 metadata 处理；
+    2. TensorRT/TFLite/CoreML 等运行时对单输入图最简单、最稳定；
+    3. 部署通常固定在一个工作点上，切换只需重新导出（秒级），不需要重训；
+    4. `cond: none` 的模型本身就能在导出后运行时切换 (n, stride)（输入通道恒为 3K），只有 FiLM 模型受此限制。
+
+用 `set_frame_cond(model, n, s)` 选择要固化的 (n, s)，它同时写入导出 metadata；导出后的 FiLM 模型被要求以其它 (n, s) 运行时会直接报错。
+
+```python
+from ultralytics import YOLO
+from ultralytics.models.yolo.detect.temporal import TemporalPredictor, TemporalValidator, set_frame_cond
+
+model = YOLO("best.pt")
+model.val(data="data.yaml", validator=TemporalValidator.at(2, 3))  # n=2, stride=3
+model.predict("video.mp4", predictor=TemporalPredictor.at(1, 1))
+set_frame_cond(model.model, 2, 1)
+model.export(format="onnx")  # FiLM 固化为 (2, 1)
+```
+
+`TemporalPredictor.at(n, s)` / `TemporalValidator.at(n, s)` 返回按参数缓存的子类，因此逐帧多次调用 `predict()` 时会复用同一个 predictor 及其环形缓冲区（`functools.partial` 做不到这一点：`Model.predict` 遇到类型不同的 predictor 会重建）。max_frames、diff_channel、slot_fill、cond 等布局参数总是从模型 metadata 读取。
+
+`scripts/tempo/eval_anyframe.py` 对一个模型遍历所有 (n, stride)（默认 n=1..K、stride 取训练集合），输出 CSV：mAP50、mAP50-95、每类 AP、延迟，以及该组合是否在训练中出现过（`trained`）；列与 `matrix.csv` 一致，可与阶段 1 的固定帧模型逐项对比。
+
+```bash
+python scripts/tempo/eval_anyframe.py --model runs/detect/train/weights/best.pt --data data/visdrone_vid_tempo.yaml --imgsz 640 --device 0
+```
 
 ## 推理与导出
 
@@ -142,7 +183,9 @@ yolo val model=runs/detect/train/weights/best.pt data=data/stvd_tempo.yaml
 3. **训练可视化**：`train_batch*.jpg` 等图只画前 3 个通道，即最早帧，而框属于目标帧；仅影响可视化。
 4. **推理需显式指定 `predictor=TemporalPredictor`**：默认 `DetectionPredictor` 不会组帧，会因通道数不匹配报错。对图片目录推理时，加载器按文件名字典序排序，帧号未补零时请传入已排序的文件列表。
 5. **只接入了 detect 任务**：`segment/pose/obb` 的 Trainer 覆盖了 `get_model`，不会自动 inflate 预训练权重（数据集本身可用）。
-6. **`random_frames`** 只实现了"槽位置零"的数据接口；模型侧尚无显式的帧数输入，留给后续阶段。
+6. **FiLM 通过 hook 和模块状态（`film.cond`）传递 (n, s)**：同一个模型对象不要在多个线程里同时以不同的 (n, s) 推理；TorchScript `script` 不支持（导出使用 tracing，已验证 ONNX）。
 7. **缓存**：RAM/disk 缓存按帧生效；训练时的图像缓冲区（`max_buffer_length`）按帧计数，多帧时实际覆盖的样本更少。
 8. **未在 GPU / DDP / SLURM 上运行过**：所有验证都在 CPU、合成数据上完成；四个适配器只在按公开格式构造的小样本上测试过，真实数据请先跑 `--inspect` 核对。
-9. **UAVDT 官方划分**未内置（需 `--val-seqs`）；VisDrone 的 ignored regions 只丢弃了框，图像中的对应区域没有遮盖：其中的目标在训练时被当作背景，验证时在这些区域的检测会被计为误检（官方评测会忽略它们），因此 mAP 会略偏低。
+9. **UAVDT 官方划分**未内置（需 `--val-seqs`）；VisDrone 的 ignored regions 默认按帧用灰度 114 遮盖（`--mask-value`、`--no-mask-ignored` 可调），被遮盖的帧会重新编码为 JPEG（质量 95），其余帧仍是符号链接；UAVDT 的 `_gt_ignore.txt` 没有遮盖。
+10. **延迟与 n 无关**：输入通道固定为 3K，不同 n 的模型前向计算量相同；`eval_anyframe.py` 里不同 n 的延迟差异只来自测量噪声和预处理。
+11. **K 必须一致才能从阶段 1 权重加载**：`inflate_first_conv` 只扩展 3 通道权重；阶段 1 的 3n 通道权重需要 `max_frames = n`。

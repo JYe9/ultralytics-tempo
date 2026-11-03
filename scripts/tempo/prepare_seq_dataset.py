@@ -4,7 +4,8 @@ r"""Convert video detection datasets into the temporal YOLO layout used by Tempo
 Adapters:
     stvd          STVD (arXiv:2410.13616): images with YOLO txt labels, sequences from --seq-pattern or directories
     visdrone-vid  VisDrone2019-VID: <split dir>/sequences/<seq>/*.jpg + annotations/<seq>.txt; drops ignored regions
-                  (category 0), others (11) and boxes with score 0; --class-map remaps the other categories
+                  (category 0), others (11) and boxes with score 0; --class-map remaps the other categories; each
+                  frame's own ignored regions are filled with --mask-value (default 114) unless --no-mask-ignored
     uavdt         UAVDT DET/MOT: UAV-benchmark-M/<M0101>/img*.jpg + GT/<M0101>_gt_whole.txt (1 car, 2 truck, 3 bus)
     mot           MOT17/MOT20: train/<seq>/{img1,gt/gt.txt,seqinfo.ini}; pedestrians (class 1) with the evaluation
                   flag set and visibility >= --min-visibility; MOT17 detector copies (DPM/FRCNN/SDP) are deduplicated
@@ -72,6 +73,7 @@ class Sequence:
     split: str | None = None  # official split if the dataset defines one
     fps: float | None = None
     motion: str = "unknown"
+    ignored: list[list[tuple]] = field(default_factory=list)  # per-frame ignored regions (x1, y1, x2, y2) in pixels
 
 
 def images_in(d: Path) -> list[Path]:
@@ -165,10 +167,16 @@ def visdrone_vid(root: Path, opt: argparse.Namespace) -> tuple[list[Sequence], l
                 print(f"WARNING: no annotations for {d}, skipped")
                 continue
             a = read_rows(ann, 8)  # frame, id, left, top, w, h, score, category, truncation, occlusion
-            a = a[a[:, 6] > 0]  # score 0 marks boxes ignored in evaluation
-            rows = [(int(r[0]), int(r[7]), *r[2:6]) for r in a]
             frames = sorted(images_in(d), key=frame_number)
-            sequences.append(box_sequence(d.name, frames, rows, cmap, split=split))
+            seq = box_sequence(d.name, frames, [(int(r[0]), int(r[7]), *r[2:6]) for r in a[a[:, 6] > 0]], cmap, split)
+            index, (iw, ih) = {frame_number(f): i for i, f in enumerate(frames)}, image_size(frames[0])
+            seq.ignored = [[] for _ in frames]
+            for r in a[a[:, 7] == 0]:  # category 0: ignored region of that frame
+                if int(r[0]) in index:
+                    x1, y1, x2, y2 = r[2], r[3], r[2] + r[4], r[3] + r[5]
+                    box = (max(int(x1), 0), max(int(y1), 0), min(int(np.ceil(x2)), iw), min(int(np.ceil(y2)), ih))
+                    seq.ignored[index[int(r[0])]].append(box)
+            sequences.append(seq)
     return sequences, opt.names or VISDRONE_NAMES
 
 
@@ -188,7 +196,7 @@ def uavdt(root: Path, opt: argparse.Namespace) -> tuple[list[Sequence], list[str
 
 
 def mot(root: Path, opt: argparse.Namespace) -> tuple[list[Sequence], list[str]]:
-    """MOT17/MOT20: <seq>/img1 frames with gt/gt.txt; keeps evaluated pedestrians with visibility >= --min-visibility."""
+    """MOT17/MOT20: <seq>/img1 frames and gt/gt.txt; evaluated pedestrians with visibility >= --min-visibility."""
     cmap = class_map(opt, {1: 0})
     sequences, seen = [], set()
     for gt in sorted(root.rglob("gt/gt.txt")):
@@ -260,10 +268,22 @@ def report(sequences: list[Sequence], names: list[str], splits: dict | None = No
     lengths = sorted(len(s.frames) for s in sequences)
     if lengths:
         print(f"frames per sequence: min {lengths[0]}, median {lengths[len(lengths) // 2]}, max {lengths[-1]}")
+    if ignored := sum(len(r) for s in sequences for r in s.ignored):
+        print(f"ignored regions: {ignored} (masked when converting unless --no-mask-ignored)")
     counts = Counter(int(b[0]) for s in sequences for lb in s.labels for b in lb)
     print("class instances: " + ", ".join(f"{names[c] if c < len(names) else c}={counts[c]}" for c in sorted(counts)))
     for split, parts in (splits or {}).items():
         print(f"  {split}: {len(parts)} sequences, {sum(b - a for _, a, b in parts)} frames")
+
+
+def write_masked(src: Path, dst: Path, regions: list[tuple], value: int) -> None:
+    """Write a copy of image `src` to `dst` with the pixel rectangles (x1, y1, x2, y2) filled with gray `value`."""
+    import cv2
+
+    im = cv2.imread(str(src))
+    for x1, y1, x2, y2 in regions:
+        im[y1:y2, x1:x2] = value
+    cv2.imwrite(str(dst), im, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
 
 def write(splits: dict, names: list[str], opt: argparse.Namespace) -> Path:
@@ -276,11 +296,13 @@ def write(splits: dict, names: list[str], opt: argparse.Namespace) -> Path:
             lb_dir.mkdir(parents=True, exist_ok=True)
             for i in range(a, b):
                 src, dst = s.frames[i], im_dir / f"{i:06d}{s.frames[i].suffix.lower()}"
-                if not dst.exists():
-                    if opt.copy:
-                        shutil.copy2(src, dst)
-                    else:
-                        os.symlink(src.resolve(), dst)
+                dst.unlink(missing_ok=True)  # never write through an old symlink into the source dataset
+                if opt.mask_ignored and s.ignored and s.ignored[i]:
+                    write_masked(src, dst, s.ignored[i], opt.mask_value)
+                elif opt.copy:
+                    shutil.copy2(src, dst)
+                else:
+                    os.symlink(src.resolve(), dst)
                 lines = [f"{int(c)} {x:.6f} {y:.6f} {w:.6f} {h:.6f}" for c, x, y, w, h in s.labels[i]]
                 (lb_dir / f"{i:06d}.txt").write_text("\n".join(lines) + ("\n" if lines else ""))
     temporal = {"num_frames": opt.num_frames, "stride": opt.stride, "seq_pattern": None, "diff_channel": opt.diff}
@@ -341,6 +363,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val-seqs", nargs="+", default=[], help="validation sequence names for --split seqs")
     parser.add_argument("--class-map", default=None, help='JSON source-category -> class id, e.g. \'{"1": 0, "4": 1}\'')
     parser.add_argument("--names", nargs="+", default=None, help="output class names in id order")
+    parser.add_argument("--mask-ignored", action="store_true", default=True, help="visdrone-vid: fill ignored regions")
+    parser.add_argument("--no-mask-ignored", dest="mask_ignored", action="store_false", help="keep ignored regions")
+    parser.add_argument("--mask-value", type=int, default=114, help="gray value for masked ignored regions")
     parser.add_argument("--min-visibility", type=float, default=0.0, help="mot: minimum visibility ratio")
     parser.add_argument(
         "--seq-pattern", default=None, help="stvd: file name regex with (?P<idx>..), optional (?P<seq>..)"
